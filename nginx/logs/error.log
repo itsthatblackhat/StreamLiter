@@ -1,0 +1,2 @@
+2024/08/13 15:34:22 [emerg] 30524#14148: CreateFile() "C:\ProgrammingProjects\StreamLiter\nginx/conf/nginx.conf" failed (3: The system cannot find the path specified)
+2024/08/13 15:34:39 [emerg] 19668#26244: CreateFile() "C:\ProgrammingProjects\StreamLiter\nginx/conf/nginx.conf" failed (3: The system cannot find the path specified)
