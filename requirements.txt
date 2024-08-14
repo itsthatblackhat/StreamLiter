@@ -1,0 +1,13 @@
+queue
+sys
+subprocess
+threading
+time
+os
+cv2
+numpy
+psutil
+requests
+PyQt5
+configparser
+logging
