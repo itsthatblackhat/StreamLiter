@@ -1,3 +1,4 @@
+import queue
 import sys
 import subprocess
 import threading
@@ -24,7 +25,6 @@ logger = logging.getLogger(__name__)
 # Configuration file
 config_file = 'config.ini'
 
-
 class StreamLiterApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -39,6 +39,12 @@ class StreamLiterApp(QWidget):
 
         # Initialize audio devices
         self.audio_devices = self.get_audio_devices()
+
+        # Initialize UI elements first, so they exist before applying settings
+        self.quality_preset_input = QComboBox(self)
+
+        # Initialize video resolution and other settings
+        self.update_application_settings()
 
         # Create a main layout
         main_layout = QVBoxLayout()
@@ -138,8 +144,34 @@ class StreamLiterApp(QWidget):
 
         self.setLayout(main_layout)
 
+        # Initialize the frame queue with unlimited size
+        self.frame_queue = queue.Queue()
+
+        # Start FFmpeg capture in a separate thread
+        self.capture_thread = threading.Thread(target=self.ffmpeg_capture)
+        self.capture_thread.daemon = True
+        self.capture_thread.start()
+
         # Check RTMP Server Status
         self.check_rtmp_server_status()
+
+    def update_application_settings(self):
+        self.rtmp_url = self.config.get('Streaming', 'rtmp_url', fallback='rtmp://localhost/live')
+        self.stream_key = self.config.get('Streaming', 'stream_key', fallback='your_stream_key')
+        self.video_res = self.config.get('Video', 'resolution', fallback='1920x1080')
+        self.local_rtmp_server = self.config.get('RTMP', 'server', fallback='localhost')
+        self.local_rtmp_port = self.config.get('RTMP', 'port', fallback='1935')
+        self.preset = self.config.get('Streaming', 'preset', fallback='veryfast')
+        self.crf = self.config.get('Streaming', 'crf', fallback='23')
+        self.maxrate = self.config.get('Streaming', 'maxrate', fallback='8M')
+        self.bufsize = self.config.get('Streaming', 'bufsize', fallback='10M')
+        self.quality_preset = self.config.get('Streaming', 'quality_preset', fallback='Medium')
+        self.gop_size = self.config.get('FFmpeg', 'gop_size', fallback='30')
+        self.tune = self.config.get('FFmpeg', 'tune', fallback='zerolatency')
+        self.fflags = self.config.get('FFmpeg', 'fflags', fallback='nobuffer')
+        self.flags = self.config.get('FFmpeg', 'flags', fallback='low_delay')
+        self.probesize = self.config.get('FFmpeg', 'probesize', fallback='32')
+        self.apply_quality_preset()
 
     def switch_view(self, index):
         self.stack.setCurrentIndex(index)
@@ -183,52 +215,195 @@ class StreamLiterApp(QWidget):
 
         return editor_widget
 
+    def ffmpeg_capture(self):
+        capture_command = [
+            'C:\\ProgrammingProjects\\StreamLiter\\ffmpeg\\bin\\ffmpeg.exe',
+            '-video_size', f'{self.video_res}',
+            '-framerate', '60',
+            '-f', 'gdigrab',
+            '-i', 'desktop',
+            '-pix_fmt', 'bgr24',
+            '-f', 'rawvideo', '-'
+        ]
+        logger.info(f"Starting FFmpeg with command: {' '.join(capture_command)}")
+
+        try:
+            self.ffmpeg_process = subprocess.Popen(
+                capture_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=10 ** 8  # Large buffer size
+            )
+
+            while True:
+                # Check if FFmpeg process is still running
+                if self.ffmpeg_process.poll() is not None:
+                    logger.error("FFmpeg process has terminated unexpectedly.")
+                    stderr_output = self.ffmpeg_process.stderr.read().decode('utf-8')
+                    logger.error(f"FFmpeg stderr: {stderr_output}")
+                    break
+
+                raw_frame = self.ffmpeg_process.stdout.read(1920 * 1080 * 3)
+                if not raw_frame:
+                    logger.error("No data read from FFmpeg stdout. FFmpeg may have exited.")
+                    stderr_output = self.ffmpeg_process.stderr.read().decode('utf-8')
+                    logger.error(f"FFmpeg stderr: {stderr_output}")
+                    break
+
+                if len(raw_frame) == 1920 * 1080 * 3:
+                    frame = np.frombuffer(raw_frame, np.uint8).reshape((1080, 1920, 3))
+                    self.frame_queue.put(frame)
+                    logger.debug(f"Frame added to queue. Queue size: {self.frame_queue.qsize()}")
+                else:
+                    logger.warning(f"Incomplete frame read from FFmpeg: {len(raw_frame)} bytes")
+
+                # Add small sleep to handle potential buffering issues
+                time.sleep(0.01)
+
+        except Exception as e:
+            logger.error(f"Exception in ffmpeg_capture: {str(e)}")
+
     def create_settings_view(self):
-        settings_layout = QFormLayout()
+        settings_layout = QVBoxLayout()
+
+        # Streaming Settings Group
+        streaming_group = QVBoxLayout()
+        streaming_group_box = QWidget()
+        streaming_group_box.setLayout(streaming_group)
+        streaming_group_box.setStyleSheet("background-color: #2b2b2b; color: #ffffff; border: 1px solid #444444;")
+
+        streaming_layout = QFormLayout()
 
         # Create settings fields
         self.rtmp_url_input = QLineEdit(self)
         self.rtmp_url_input.setText(self.config.get('Streaming', 'rtmp_url', fallback='rtmp://localhost/live'))
-        settings_layout.addRow('Stream RTMP URL:', self.rtmp_url_input)
+        streaming_layout.addRow('Stream RTMP URL:', self.rtmp_url_input)
 
         self.stream_key_input = QLineEdit(self)
         self.stream_key_input.setText(self.config.get('Streaming', 'stream_key', fallback='your_stream_key'))
-        settings_layout.addRow('Stream RTMP Key:', self.stream_key_input)
+        streaming_layout.addRow('Stream RTMP Key:', self.stream_key_input)
 
         self.video_res_input = QComboBox(self)
         self.video_res_input.addItems(["1920x1080", "1280x720", "640x480"])
         self.video_res_input.setCurrentText(self.config.get('Video', 'resolution', fallback='1920x1080'))
-        settings_layout.addRow('Streaming Resolution:', self.video_res_input)
+        streaming_layout.addRow('Streaming Resolution:', self.video_res_input)
 
         self.audio_human_input_device = QComboBox(self)
         self.audio_human_input_device.addItems(self.audio_devices["Recording"])
-        settings_layout.addRow('Human Audio Input Device:', self.audio_human_input_device)
+        streaming_layout.addRow('Human Audio Input Device:', self.audio_human_input_device)
 
         self.system_audio_input_device = QComboBox(self)
         self.system_audio_input_device.addItems(self.audio_devices["Playback"])
-        settings_layout.addRow('System Audio Input Device:', self.system_audio_input_device)
+        streaming_layout.addRow('System Audio Input Device:', self.system_audio_input_device)
 
         self.local_rtmp_server_input = QLineEdit(self)
         self.local_rtmp_server_input.setText(self.config.get('RTMP', 'server', fallback='localhost'))
-        settings_layout.addRow('Local RTMP Server:', self.local_rtmp_server_input)
+        streaming_layout.addRow('Local RTMP Server:', self.local_rtmp_server_input)
 
         self.local_rtmp_port_input = QLineEdit(self)
         self.local_rtmp_port_input.setText(self.config.get('RTMP', 'port', fallback='1935'))
-        settings_layout.addRow('Local RTMP Port:', self.local_rtmp_port_input)
+        streaming_layout.addRow('Local RTMP Port:', self.local_rtmp_port_input)
+
+        streaming_group.addLayout(streaming_layout)
+
+        # FFmpeg Settings Group
+        ffmpeg_group = QVBoxLayout()
+        ffmpeg_group_box = QWidget()
+        ffmpeg_group_box.setLayout(ffmpeg_group)
+        ffmpeg_group_box.setStyleSheet("background-color: #2b2b2b; color: #ffffff; border: 1px solid #444444;")
+
+        ffmpeg_layout = QFormLayout()
+
+        # Add Quality Preset Selection
+        self.quality_preset_input = QComboBox(self)
+        self.quality_preset_input.addItems(["High", "Medium", "Low"])
+        self.quality_preset_input.setCurrentText(self.config.get('Streaming', 'quality_preset', fallback='Medium'))
+        self.quality_preset_input.currentIndexChanged.connect(self.apply_quality_preset)
+        ffmpeg_layout.addRow('Quality Preset:', self.quality_preset_input)
+
+        # Streaming Video Options
+        self.preset_input = QComboBox(self)
+        self.preset_input.addItems(
+            ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"])
+        self.preset_input.setCurrentText(self.config.get('Streaming', 'preset', fallback='veryfast'))
+        ffmpeg_layout.addRow('FFmpeg Preset:', self.preset_input)
+
+        self.crf_input = QLineEdit(self)
+        self.crf_input.setText(self.config.get('Streaming', 'crf', fallback='23'))
+        ffmpeg_layout.addRow('Constant Rate Factor (CRF):', self.crf_input)
+
+        self.maxrate_input = QLineEdit(self)
+        self.maxrate_input.setText(self.config.get('Streaming', 'maxrate', fallback='8M'))
+        ffmpeg_layout.addRow('Max Bitrate (e.g., 8M):', self.maxrate_input)
+
+        self.bufsize_input = QLineEdit(self)
+        self.bufsize_input.setText(self.config.get('Streaming', 'bufsize', fallback='10M'))
+        ffmpeg_layout.addRow('Buffer Size (e.g., 10M):', self.bufsize_input)
+
+        self.gop_size_input = QLineEdit(self)
+        self.gop_size_input.setText(self.config.get('FFmpeg', 'gop_size', fallback='30'))
+        ffmpeg_layout.addRow('GOP Size:', self.gop_size_input)
+
+        self.tune_input = QComboBox(self)
+        self.tune_input.addItems(["zerolatency", "film", "animation", "grain"])
+        self.tune_input.setCurrentText(self.config.get('FFmpeg', 'tune', fallback='zerolatency'))
+        ffmpeg_layout.addRow('Tune:', self.tune_input)
+
+        self.fflags_input = QLineEdit(self)
+        self.fflags_input.setText(self.config.get('FFmpeg', 'fflags', fallback='nobuffer'))
+        ffmpeg_layout.addRow('FFlags:', self.fflags_input)
+
+        self.flags_input = QLineEdit(self)
+        self.flags_input.setText(self.config.get('FFmpeg', 'flags', fallback='low_delay'))
+        ffmpeg_layout.addRow('Flags:', self.flags_input)
+
+        self.probesize_input = QLineEdit(self)
+        self.probesize_input.setText(self.config.get('FFmpeg', 'probesize', fallback='32'))
+        ffmpeg_layout.addRow('Probesize:', self.probesize_input)
+
+        ffmpeg_group.addLayout(ffmpeg_layout)
+
+        # Add the groups to the main settings layout
+        settings_layout.addWidget(streaming_group_box)
+        settings_layout.addWidget(ffmpeg_group_box)
 
         save_button = QPushButton("Save Settings", self)
         save_button.clicked.connect(self.save_settings)
-        settings_layout.addRow(save_button)
+        settings_layout.addWidget(save_button)
 
         settings_widget = QWidget()
         settings_widget.setLayout(settings_layout)
 
         return settings_widget
 
+    def apply_quality_preset(self):
+        preset = self.quality_preset_input.currentText()
+
+        if preset == "High":
+            self.preset_input.setCurrentText("slow")
+            self.crf_input.setText("18")
+            self.maxrate_input.setText("10M")
+            self.bufsize_input.setText("20M")
+        elif preset == "Medium":
+            self.preset_input.setCurrentText("veryfast")
+            self.crf_input.setText("23")
+            self.maxrate_input.setText("8M")
+            self.bufsize_input.setText("10M")
+        elif preset == "Low":
+            self.preset_input.setCurrentText("ultrafast")
+            self.crf_input.setText("28")
+            self.maxrate_input.setText("4M")
+            self.bufsize_input.setText("8M")
+
     def save_settings(self):
         self.config['Streaming'] = {
             'rtmp_url': self.rtmp_url_input.text(),
-            'stream_key': self.stream_key_input.text()
+            'stream_key': self.stream_key_input.text(),
+            'quality_preset': self.quality_preset_input.currentText(),
+            'preset': self.preset_input.currentText(),
+            'crf': self.crf_input.text(),
+            'maxrate': self.maxrate_input.text(),
+            'bufsize': self.bufsize_input.text(),
         }
         self.config['Video'] = {
             'resolution': self.video_res_input.currentText()
@@ -241,6 +416,13 @@ class StreamLiterApp(QWidget):
             'server': self.local_rtmp_server_input.text(),
             'port': self.local_rtmp_port_input.text()
         }
+        self.config['FFmpeg'] = {
+            'gop_size': self.gop_size_input.text(),
+            'tune': self.tune_input.currentText(),
+            'fflags': self.fflags_input.text(),
+            'flags': self.flags_input.text(),
+            'probesize': self.probesize_input.text()
+        }
         with open(config_file, 'w') as configfile:
             self.config.write(configfile)
         logger.info("Settings saved.")
@@ -248,27 +430,24 @@ class StreamLiterApp(QWidget):
         # Update the application state to use the new settings
         self.update_application_settings()
 
-    def update_application_settings(self):
-        self.rtmp_url = self.config.get('Streaming', 'rtmp_url')
-        self.stream_key = self.config.get('Streaming', 'stream_key')
-        self.video_res = self.config.get('Video', 'resolution')
-        self.local_rtmp_server = self.config.get('RTMP', 'server')
-        self.local_rtmp_port = self.config.get('RTMP', 'port')
-
     def switch_source(self):
         source = self.source_combo.currentText()
+        logger.info(f"Switching source to: {source}")
         if source == "Screen Capture":
             self.start_screen_capture()
 
     def start_screen_capture(self):
         # Capture the selected monitor
-        screen_width, screen_height = 1920, 1080  # Adjust these values if necessary
+        monitor_index = 0  # Default to the primary monitor
+
+        # Get the selected video resolution from settings
+        screen_width, screen_height = map(int, self.video_res.split('x'))
 
         # Start screen capture with FFmpeg for internal preview
         capture_command = [
             'C:\\ProgrammingProjects\\StreamLiter\\ffmpeg\\bin\\ffmpeg.exe',
             '-video_size', f'{screen_width}x{screen_height}',
-            '-framerate', '30',
+            '-framerate', '60',  # Increase framerate for smoother video
             '-f', 'gdigrab',
             '-i', 'desktop',
             '-pix_fmt', 'bgr24',  # Ensure the correct format for OpenCV
@@ -295,23 +474,25 @@ class StreamLiterApp(QWidget):
 
     def update_preview(self):
         try:
-            if self.ffmpeg_process and self.ffmpeg_process.stdout:
-                raw_frame = self.ffmpeg_process.stdout.read(1920 * 1080 * 3)
-                if len(raw_frame) == 1920 * 1080 * 3:
-                    frame = np.frombuffer(raw_frame, np.uint8).reshape((1080, 1920, 3))
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Drain the queue to get the most recent frame
+            while not self.frame_queue.empty():
+                frame = self.frame_queue.get_nowait()
 
-                    # Resize the frame to fit the preview label size
-                    frame = cv2.resize(frame, (self.preview_label.width(), self.preview_label.height()))
+            if frame is not None:
+                logger.debug(f"Displaying the most recent frame with shape: {frame.shape}")
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = cv2.resize(frame, (self.preview_label.width(), self.preview_label.height()))
 
-                    img = QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QImage.Format_RGB888)
-                    self.preview_label.setPixmap(QPixmap.fromImage(img))
-                else:
-                    logger.warning("No frame captured for preview.")
+                img = QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QImage.Format_RGB888)
+                self.preview_label.setPixmap(QPixmap.fromImage(img))
+            else:
+                logger.warning("No frame available for preview.")
+
+        except queue.Empty:
+            logger.warning("Frame queue is empty for preview.")
+
         except Exception as e:
-            self.connection_status_label.setText("Connection Status: Error Occurred")
-            self.connection_status_label.setStyleSheet("font: 16px; color: red;")
-            logger.error(f"Error updating preview: {e}")
+            logger.error(f"Error in update_preview: {str(e)}")
 
     def get_audio_devices(self):
         # Using a PowerShell script to get audio devices
@@ -342,35 +523,39 @@ class StreamLiterApp(QWidget):
         streaming_thread.start()
 
     def start_streaming(self):
-        screen_width, screen_height = 1920, 1080  # Set screen dimensions
-        rtmp_url = f"rtmp://127.0.0.1:1935/live/test"  # RTMP server URL
-
-        capture_command = [
-            'C:\\ProgrammingProjects\\StreamLiter\\ffmpeg\\bin\\ffmpeg.exe',
-            '-video_size', f'{screen_width}x{screen_height}',
-            '-framerate', '30',
-            '-f', 'gdigrab',
-            '-i', 'desktop',
-            '-pix_fmt', 'bgr24',
-            '-f', 'flv',  # Stream format for RTMP
-            rtmp_url
-        ]
-
         try:
-            logger.info(f"Starting FFmpeg with command: {' '.join(capture_command)}")
             self.streaming_status_label.setText("Streaming Status: Streaming...")
             self.streaming_status_label.setStyleSheet("font: 16px; color: green;")
 
-            self.ffmpeg_process = subprocess.Popen(
-                capture_command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE  # Capture FFmpeg's stderr output
-            )
+            # Get the selected video resolution from settings
+            screen_width, screen_height = map(int, self.video_res.split('x'))
 
-            self.timer.start(30)  # Update preview at the same FPS
+            # Set FFmpeg command with low-latency settings
+            stream_command = [
+                'C:\\ProgrammingProjects\\StreamLiter\\ffmpeg\\bin\\ffmpeg.exe',
+                '-video_size', f'{screen_width}x{screen_height}',
+                '-framerate', '60',
+                '-f', 'gdigrab',
+                '-i', 'desktop',
+                '-pix_fmt', 'yuv420p',
+                '-c:v', 'libx264',
+                '-preset', self.preset,
+                '-tune', self.tune,
+                '-g', self.gop_size,  # Set keyframe interval
+                '-fflags', self.fflags,
+                '-flags', self.flags,
+                '-probesize', self.probesize,
+                '-muxdelay', '0',
+                '-muxpreload', '0',
+                '-f', 'flv',
+                self.rtmp_url
+            ]
+
+            logger.info(f"Starting FFmpeg with command: {' '.join(stream_command)}")
+            self.streaming_process = subprocess.Popen(stream_command)
 
         except Exception as e:
-            self.streaming_status_label.setText("Streaming Status: Error Occurred")
+            self.streaming_status_label.setText("Streaming Status: Error")
             self.streaming_status_label.setStyleSheet("font: 16px; color: red;")
             logger.error(f"Failed to start streaming: {e}")
 
