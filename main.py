@@ -1,10 +1,9 @@
-import queue
+import collections
 import sys
 import subprocess
 import threading
 import time
 import os
-
 import cv2
 import numpy as np
 import psutil
@@ -14,9 +13,14 @@ from PyQt5.QtWidgets import (
     QHBoxLayout, QListWidget, QLineEdit, QFormLayout, QStackedWidget
 )
 from PyQt5.QtGui import QImage, QPixmap
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QTimer, Qt, QUrl
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+from PyQt5.QtMultimediaWidgets import QVideoWidget
 import configparser
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue, Full
+import vlc
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,6 +32,8 @@ config_file = 'config.ini'
 class StreamLiterApp(QWidget):
     def __init__(self):
         super().__init__()
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.frame_queue = Queue(maxsize=5)
 
         # Set window properties
         self.setWindowTitle('StreamLiter')
@@ -40,6 +46,9 @@ class StreamLiterApp(QWidget):
         # Initialize audio devices
         self.audio_devices = self.get_audio_devices()
 
+        # Initialize VLC instance and media player
+        self.initialize_vlc()
+
         # Initialize UI elements first, so they exist before applying settings
         self.quality_preset_input = QComboBox(self)
 
@@ -49,7 +58,7 @@ class StreamLiterApp(QWidget):
         # Create a main layout
         main_layout = QVBoxLayout()
 
-        # Create a list widget for the sidebar
+        # Sidebar and stacked widget setup
         self.sidebar = QListWidget()
         self.sidebar.setFixedWidth(200)
         self.sidebar.addItem("Editor")
@@ -57,8 +66,6 @@ class StreamLiterApp(QWidget):
         self.sidebar.addItem("App Store")
         self.sidebar.addItem("Highlighter")
         self.sidebar.addItem("Settings")
-
-        # Set a dark theme for the sidebar
         self.sidebar.setStyleSheet("""
             QListWidget {
                 background-color: #2b2b2b;
@@ -70,39 +77,56 @@ class StreamLiterApp(QWidget):
                 color: #ffffff;
             }
         """)
-
-        # Create a stacked widget to switch between different views
         self.stack = QStackedWidget()
 
-        # Editor View
+        # Views
         self.editor_view = self.create_editor_view()
         self.stack.addWidget(self.editor_view)
-
-        # Overlays View (placeholder)
         self.overlays_view = QLabel("Overlays View (Coming Soon)", self)
-        self.overlays_view.setAlignment(Qt.AlignCenter)
         self.stack.addWidget(self.overlays_view)
-
-        # App Store View (placeholder)
         self.appstore_view = QLabel("App Store View (Coming Soon)", self)
-        self.appstore_view.setAlignment(Qt.AlignCenter)
         self.stack.addWidget(self.appstore_view)
-
-        # Highlighter View (placeholder)
         self.highlighter_view = QLabel("Highlighter View (Coming Soon)", self)
-        self.highlighter_view.setAlignment(Qt.AlignCenter)
         self.stack.addWidget(self.highlighter_view)
-
-        # Settings View
         self.settings_view = self.create_settings_view()
         self.stack.addWidget(self.settings_view)
 
-        # Add the sidebar and stacked widget to the main layout
+        # Layout
         h_layout = QHBoxLayout()
         h_layout.addWidget(self.sidebar)
         h_layout.addWidget(self.stack)
-
         main_layout.addLayout(h_layout)
+
+        # Status Labels
+        self.local_rtmp_status_label = QLabel("Local RTMP Server: Not Running", self)
+        self.local_rtmp_status_label.setStyleSheet("font: 16px; color: red;")
+        self.connection_status_label = QLabel("Connection Status: Not Connected", self)
+        self.connection_status_label.setStyleSheet("font: 16px; color: red;")
+        self.streaming_status_label = QLabel("Streaming Status: Not Streaming", self)
+        self.streaming_status_label.setStyleSheet("font: 16px; color: red;")
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(self.local_rtmp_status_label)
+        status_layout.addWidget(self.connection_status_label)
+        status_layout.addWidget(self.streaming_status_label)
+        main_layout.addLayout(status_layout)
+
+        # RTMP Server Control Buttons
+        self.start_rtmp_button = QPushButton("Start RTMP Server", self)
+        self.start_rtmp_button.clicked.connect(self.start_local_rtmp_server)
+        self.stop_rtmp_button = QPushButton("Stop RTMP Server", self)
+        self.stop_rtmp_button.clicked.connect(self.stop_local_rtmp_server)
+        rtmp_button_layout = QHBoxLayout()
+        rtmp_button_layout.addWidget(self.start_rtmp_button)
+        rtmp_button_layout.addWidget(self.stop_rtmp_button)
+        main_layout.addLayout(rtmp_button_layout)
+
+        # Apply Layout
+        self.setLayout(main_layout)
+
+        # Start FFmpeg capture in a separate thread
+        self.capture_thread = threading.Thread(target=self.ffmpeg_capture)
+        self.capture_thread.daemon = True
+        self.capture_thread.start()
 
         # Timer for updating the preview
         self.timer = QTimer(self)
@@ -110,50 +134,76 @@ class StreamLiterApp(QWidget):
 
         # Connect sidebar selection to the stacked widget
         self.sidebar.currentRowChanged.connect(self.switch_view)
-
-        # Initialize the sidebar selection
         self.sidebar.setCurrentRow(0)
-
-        # Create the connection status labels and arrange them vertically
-        self.local_rtmp_status_label = QLabel("Local RTMP Server: Not Running", self)
-        self.local_rtmp_status_label.setStyleSheet("font: 16px; color: red;")
-
-        self.connection_status_label = QLabel("Connection Status: Not Connected", self)
-        self.connection_status_label.setStyleSheet("font: 16px; color: red;")
-
-        self.streaming_status_label = QLabel("Streaming Status: Not Streaming", self)
-        self.streaming_status_label.setStyleSheet("font: 16px; color: red;")
-
-        status_layout = QHBoxLayout()
-        status_layout.addWidget(self.local_rtmp_status_label)
-        status_layout.addWidget(self.connection_status_label)
-        status_layout.addWidget(self.streaming_status_label)
-
-        # Add buttons for RTMP server control
-        self.start_rtmp_button = QPushButton("Start RTMP Server", self)
-        self.start_rtmp_button.clicked.connect(self.start_local_rtmp_server)
-        self.stop_rtmp_button = QPushButton("Stop RTMP Server", self)
-        self.stop_rtmp_button.clicked.connect(self.stop_local_rtmp_server)
-
-        rtmp_button_layout = QHBoxLayout()
-        rtmp_button_layout.addWidget(self.start_rtmp_button)
-        rtmp_button_layout.addWidget(self.stop_rtmp_button)
-
-        main_layout.addLayout(status_layout)
-        main_layout.addLayout(rtmp_button_layout)
-
-        self.setLayout(main_layout)
-
-        # Initialize the frame queue with unlimited size
-        self.frame_queue = queue.Queue()
-
-        # Start FFmpeg capture in a separate thread
-        self.capture_thread = threading.Thread(target=self.ffmpeg_capture)
-        self.capture_thread.daemon = True
-        self.capture_thread.start()
 
         # Check RTMP Server Status
         self.check_rtmp_server_status()
+
+    def initialize_vlc(self):
+        try:
+            self.vlc_instance = vlc.Instance()
+            self.vlc_player = self.vlc_instance.media_player_new()
+            logger.info("VLC initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize VLC: {e}")
+
+    def start_preview(self):
+        try:
+            local_stream_url = f'rtmp://{self.local_rtmp_server}:{self.local_rtmp_port}/live/stream'
+            logger.info(f"Loading local preview stream from URL: {local_stream_url}")
+            media = self.vlc_instance.media_new(local_stream_url)
+            self.vlc_player.set_media(media)
+
+            # Set the player to render video in the correct widget
+            if sys.platform == "linux":  # for Linux using the X Server
+                self.vlc_player.set_xwindow(int(self.video_widget.winId()))
+            elif sys.platform == "win32":  # for Windows
+                self.vlc_player.set_hwnd(int(self.video_widget.winId()))
+            elif sys.platform == "darwin":  # for MacOS
+                self.vlc_player.set_nsobject(int(self.video_widget.winId()))
+
+            if self.vlc_player.play() == -1:
+                raise Exception("VLC failed to play the stream")
+
+            # Delay status check to give VLC time to start playback
+            QTimer.singleShot(2000, self.check_vlc_status)
+        except Exception as e:
+            self.connection_status_label.setText("Connection Status: Failed to Load Stream")
+            self.connection_status_label.setStyleSheet("font: 16px; color: red;")
+            logger.error(f"Failed to load preview: {e}")
+
+    def check_vlc_status(self):
+        if self.vlc_player.is_playing():
+            logger.info("Media player started successfully.")
+            self.connection_status_label.setText("Connection Status: Connected")
+            self.connection_status_label.setStyleSheet("font: 16px; color: green;")
+        else:
+            logger.warning("Media player failed to start.")
+            self.connection_status_label.setText("Connection Status: Failed to Start")
+            self.connection_status_label.setStyleSheet("font: 16px; color: red;")
+
+    def get_audio_devices(self):
+        # Using a PowerShell script to get audio devices
+        devices = {"Playback": ["None"], "Recording": ["None"]}
+        try:
+            process = subprocess.Popen(
+                ["powershell", "-Command", "Get-AudioDevice -List"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            output, error = process.communicate()
+            if process.returncode == 0:
+                for line in output.splitlines():
+                    if "Playback" in line:
+                        devices["Playback"].append(line.split(":")[-1].strip())
+                    elif "Recording" in line:
+                        devices["Recording"].append(line.split(":")[-1].strip())
+            else:
+                logger.error(f"Error getting audio devices: {error}")
+        except Exception as e:
+            logger.error(f"Error getting audio devices: {e}")
+        return devices
 
     def update_application_settings(self):
         self.rtmp_url = self.config.get('Streaming', 'rtmp_url', fallback='rtmp://localhost/live')
@@ -173,6 +223,25 @@ class StreamLiterApp(QWidget):
         self.probesize = self.config.get('FFmpeg', 'probesize', fallback='32')
         self.apply_quality_preset()
 
+    def apply_quality_preset(self):
+        preset = self.quality_preset_input.currentText()
+
+        if preset == "High":
+            self.preset_input.setCurrentText("slow")
+            self.crf_input.setText("18")
+            self.maxrate_input.setText("10M")
+            self.bufsize_input.setText("20M")
+        elif preset == "Medium":
+            self.preset_input.setCurrentText("veryfast")
+            self.crf_input.setText("23")
+            self.maxrate_input.setText("8M")
+            self.bufsize_input.setText("10M")
+        elif preset == "Low":
+            self.preset_input.setCurrentText("ultrafast")
+            self.crf_input.setText("28")
+            self.maxrate_input.setText("4M")
+            self.bufsize_input.setText("8M")
+
     def switch_view(self, index):
         self.stack.setCurrentIndex(index)
 
@@ -184,12 +253,11 @@ class StreamLiterApp(QWidget):
         self.source_combo.addItems(["Screen Capture", "Webcam", "Window Capture"])
         editor_layout.addWidget(self.source_combo)
 
-        # Create the preview label with a fixed size
-        self.preview_label = QLabel("Stream Preview", self)
-        self.preview_label.setFixedSize(800, 450)  # Fixed size
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setStyleSheet("background-color: #2b2b2b; color: #ffffff; border: 1px solid #444444;")
-        editor_layout.addWidget(self.preview_label)
+        # Create the video widget for stream preview
+        self.video_widget = QVideoWidget(self)
+        self.video_widget.setFixedSize(800, 450)  # Fixed size
+        self.video_widget.setStyleSheet("background-color: #2b2b2b;")
+        editor_layout.addWidget(self.video_widget)
 
         # Create the switch source and go live buttons
         button_layout = QHBoxLayout()
@@ -215,16 +283,31 @@ class StreamLiterApp(QWidget):
 
         return editor_widget
 
+    def terminate_ffmpeg_process(self):
+        """Terminate any running FFmpeg process to avoid conflicts."""
+        for proc in psutil.process_iter(['pid', 'name']):
+            if 'ffmpeg' in proc.info['name']:
+                logger.info(f"Terminating existing FFmpeg process with PID: {proc.info['pid']}")
+                proc.kill()
+
     def ffmpeg_capture(self):
+        # Ensure no other FFmpeg process is running
+        self.terminate_ffmpeg_process()
+
         capture_command = [
             'C:\\ProgrammingProjects\\StreamLiter\\ffmpeg\\bin\\ffmpeg.exe',
-            '-video_size', f'{self.video_res}',
-            '-framerate', '60',
+            '-video_size', '1920x1080',
+            '-framerate', '30',
             '-f', 'gdigrab',
             '-i', 'desktop',
-            '-pix_fmt', 'bgr24',
-            '-f', 'rawvideo', '-'
+            '-pix_fmt', 'yuv420p',
+            '-c:v', 'libx264',
+            '-b:v', '1000k',
+            '-g', '30',
+            '-f', 'flv',
+            f'rtmp://{self.local_rtmp_server}:{self.local_rtmp_port}/live/stream'
         ]
+
         logger.info(f"Starting FFmpeg with command: {' '.join(capture_command)}")
 
         try:
@@ -232,36 +315,72 @@ class StreamLiterApp(QWidget):
                 capture_command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=10 ** 8  # Large buffer size
+                bufsize=10 ** 8
             )
 
             while True:
-                # Check if FFmpeg process is still running
                 if self.ffmpeg_process.poll() is not None:
                     logger.error("FFmpeg process has terminated unexpectedly.")
                     stderr_output = self.ffmpeg_process.stderr.read().decode('utf-8')
-                    logger.error(f"FFmpeg stderr: {stderr_output}")
+                    if 'Already publishing' in stderr_output:
+                        logger.error("RTMP server is already publishing. Terminating FFmpeg process.")
+                    else:
+                        logger.error(f"FFmpeg stderr: {stderr_output}")
+                    self.connection_status_label.setText("Connection Status: FFmpeg Error")
+                    self.connection_status_label.setStyleSheet("font: 16px; color: red;")
                     break
 
-                raw_frame = self.ffmpeg_process.stdout.read(1920 * 1080 * 3)
+                raw_frame = self.ffmpeg_process.stdout.read(1280 * 720 * 3)
                 if not raw_frame:
                     logger.error("No data read from FFmpeg stdout. FFmpeg may have exited.")
                     stderr_output = self.ffmpeg_process.stderr.read().decode('utf-8')
                     logger.error(f"FFmpeg stderr: {stderr_output}")
+                    self.connection_status_label.setText("Connection Status: FFmpeg Error")
+                    self.connection_status_label.setStyleSheet("font: 16px; color: red;")
                     break
 
-                if len(raw_frame) == 1920 * 1080 * 3:
-                    frame = np.frombuffer(raw_frame, np.uint8).reshape((1080, 1920, 3))
-                    self.frame_queue.put(frame)
-                    logger.debug(f"Frame added to queue. Queue size: {self.frame_queue.qsize()}")
-                else:
-                    logger.warning(f"Incomplete frame read from FFmpeg: {len(raw_frame)} bytes")
+                try:
+                    self.frame_queue.put_nowait(raw_frame)
+                except Full:
+                    logger.warning("Frame queue is full. Dropping frame.")
 
-                # Add small sleep to handle potential buffering issues
-                time.sleep(0.01)
+                time.sleep(0.005)
 
         except Exception as e:
             logger.error(f"Exception in ffmpeg_capture: {str(e)}")
+            self.connection_status_label.setText("Connection Status: FFmpeg Error")
+            self.connection_status_label.setStyleSheet("font: 16px; color: red;")
+
+    def update_preview(self):
+        if not self.frame_queue.empty():
+            raw_frame = self.frame_queue.get()
+            frame = np.frombuffer(raw_frame, np.uint8).reshape((720, 1280, 3))
+            self.executor.submit(self.process_frame, frame)
+
+    def process_frame(self, frame):
+        try:
+            if frame is not None:
+                # Ensure proper scaling to match the preview label size
+                height, width, _ = frame.shape
+                aspect_ratio = width / height
+
+                scaled_height = self.video_widget.height()
+                scaled_width = int(scaled_height * aspect_ratio)
+
+                if scaled_width > self.video_widget.width():
+                    scaled_width = self.video_widget.width()
+                    scaled_height = int(scaled_width / aspect_ratio)
+
+                scaled_frame = cv2.resize(frame, (scaled_width, scaled_height))
+                scaled_frame = cv2.cvtColor(scaled_frame, cv2.COLOR_BGR2RGB)
+
+                img = QImage(scaled_frame.data, scaled_frame.shape[1], scaled_frame.shape[0], scaled_frame.strides[0],
+                             QImage.Format_RGB888)
+                self.video_widget.setPixmap(QPixmap.fromImage(img))
+            else:
+                logger.warning("No frame available for display.")
+        except Exception as e:
+            logger.error(f"Error in display_frame: {str(e)}")
 
     def create_settings_view(self):
         settings_layout = QVBoxLayout()
@@ -376,25 +495,6 @@ class StreamLiterApp(QWidget):
 
         return settings_widget
 
-    def apply_quality_preset(self):
-        preset = self.quality_preset_input.currentText()
-
-        if preset == "High":
-            self.preset_input.setCurrentText("slow")
-            self.crf_input.setText("18")
-            self.maxrate_input.setText("10M")
-            self.bufsize_input.setText("20M")
-        elif preset == "Medium":
-            self.preset_input.setCurrentText("veryfast")
-            self.crf_input.setText("23")
-            self.maxrate_input.setText("8M")
-            self.bufsize_input.setText("10M")
-        elif preset == "Low":
-            self.preset_input.setCurrentText("ultrafast")
-            self.crf_input.setText("28")
-            self.maxrate_input.setText("4M")
-            self.bufsize_input.setText("8M")
-
     def save_settings(self):
         self.config['Streaming'] = {
             'rtmp_url': self.rtmp_url_input.text(),
@@ -433,25 +533,65 @@ class StreamLiterApp(QWidget):
     def switch_source(self):
         source = self.source_combo.currentText()
         logger.info(f"Switching source to: {source}")
-        if source == "Screen Capture":
-            self.start_screen_capture()
+
+        # Terminate any existing FFmpeg process to avoid RTMP conflicts
+        self.terminate_ffmpeg_process()
+
+        self.connection_status_label.setText("Connection Status: Starting Capture...")
+        self.connection_status_label.setStyleSheet("font: 16px; color: orange;")
+
+        # Give a short delay before starting the actual capture
+        QTimer.singleShot(1000, self.start_screen_capture)
+
+    def is_stream_active(self):
+        """Check if the RTMP stream is already active."""
+        try:
+            response = requests.get(f"http://127.0.0.1:8080/stat")
+            if response.status_code == 200:
+                if f'<name>{self.stream_key}</name>' in response.text:
+                    return True
+            return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to check RTMP stream status: {e}")
+            return False
 
     def start_screen_capture(self):
-        # Capture the selected monitor
-        monitor_index = 0  # Default to the primary monitor
+        # Ensure the RTMP server is running
+        if not self.is_rtmp_server_running():
+            logger.error("RTMP server is not running. Cannot start screen capture.")
+            self.connection_status_label.setText("Connection Status: RTMP Server Not Running")
+            self.connection_status_label.setStyleSheet("font: 16px; color: red;")
+            return
 
-        # Get the selected video resolution from settings
-        screen_width, screen_height = map(int, self.video_res.split('x'))
+        # Check if a stream is already active on the RTMP server
+        if self.is_stream_active():
+            logger.info("Stream is already active, not starting a new capture process.")
+            self.connection_status_label.setText("Connection Status: Already Streaming")
+            self.connection_status_label.setStyleSheet("font: 16px; color: green;")
+            return
 
-        # Start screen capture with FFmpeg for internal preview
+        # Terminate any existing FFmpeg process to avoid RTMP conflicts
+        self.terminate_ffmpeg_process()
+
+        # Add a short delay to ensure resources are released
+        time.sleep(2)
+
+        # Command for capturing the screen and streaming to RTMP
         capture_command = [
             'C:\\ProgrammingProjects\\StreamLiter\\ffmpeg\\bin\\ffmpeg.exe',
-            '-video_size', f'{screen_width}x{screen_height}',
-            '-framerate', '60',  # Increase framerate for smoother video
+            '-video_size', self.video_res,
+            '-framerate', '30',
             '-f', 'gdigrab',
             '-i', 'desktop',
-            '-pix_fmt', 'bgr24',  # Ensure the correct format for OpenCV
-            '-f', 'rawvideo', '-'
+            '-pix_fmt', 'yuv420p',
+            '-c:v', 'libx264',
+            '-preset', self.preset,
+            '-tune', self.tune,
+            '-g', self.gop_size,
+            '-fflags', self.fflags,
+            '-flags', self.flags,
+            '-f', 'flv',
+            f'rtmp://{self.local_rtmp_server}:{self.local_rtmp_port}/live/stream'  # Output to local RTMP server
         ]
 
         try:
@@ -465,57 +605,21 @@ class StreamLiterApp(QWidget):
                 stderr=subprocess.PIPE
             )
 
-            self.timer.start(30)  # Set timer to update preview at the same FPS
+            # Start checking the output stream and display it after a delay
+            QTimer.singleShot(3000, self.start_preview)
 
         except Exception as e:
             self.connection_status_label.setText("Connection Status: Error Occurred")
             self.connection_status_label.setStyleSheet("font: 16px; color: red;")
             logger.error(f"Failed to start screen capture: {e}")
 
-    def update_preview(self):
+    def is_rtmp_server_running(self):
+        """Check if the RTMP server is running."""
         try:
-            # Drain the queue to get the most recent frame
-            while not self.frame_queue.empty():
-                frame = self.frame_queue.get_nowait()
-
-            if frame is not None:
-                logger.debug(f"Displaying the most recent frame with shape: {frame.shape}")
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = cv2.resize(frame, (self.preview_label.width(), self.preview_label.height()))
-
-                img = QImage(frame.data, frame.shape[1], frame.shape[0], frame.strides[0], QImage.Format_RGB888)
-                self.preview_label.setPixmap(QPixmap.fromImage(img))
-            else:
-                logger.warning("No frame available for preview.")
-
-        except queue.Empty:
-            logger.warning("Frame queue is empty for preview.")
-
-        except Exception as e:
-            logger.error(f"Error in update_preview: {str(e)}")
-
-    def get_audio_devices(self):
-        # Using a PowerShell script to get audio devices
-        devices = {"Playback": ["None"], "Recording": ["None"]}
-        try:
-            process = subprocess.Popen(
-                ["powershell", "-Command", "Get-AudioDevice -List"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            output, error = process.communicate()
-            if process.returncode == 0:
-                for line in output.splitlines():
-                    if "Playback" in line:
-                        devices["Playback"].append(line.split(":")[-1].strip())
-                    elif "Recording" in line:
-                        devices["Recording"].append(line.split(":")[-1].strip())
-            else:
-                logger.error(f"Error getting audio devices: {error}")
-        except Exception as e:
-            logger.error(f"Error getting audio devices: {e}")
-        return devices
+            response = requests.get("http://127.0.0.1:8080")
+            return response.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
 
     def start_streaming_thread(self):
         # Run the streaming in a separate thread
@@ -527,28 +631,23 @@ class StreamLiterApp(QWidget):
             self.streaming_status_label.setText("Streaming Status: Streaming...")
             self.streaming_status_label.setStyleSheet("font: 16px; color: green;")
 
-            # Get the selected video resolution from settings
-            screen_width, screen_height = map(int, self.video_res.split('x'))
-
-            # Set FFmpeg command with low-latency settings
+            # Stream locally to RTMP server
             stream_command = [
                 'C:\\ProgrammingProjects\\StreamLiter\\ffmpeg\\bin\\ffmpeg.exe',
-                '-video_size', f'{screen_width}x{screen_height}',
-                '-framerate', '60',
+                '-video_size', f'{self.video_res}',
+                '-framerate', '30',
                 '-f', 'gdigrab',
                 '-i', 'desktop',
                 '-pix_fmt', 'yuv420p',
                 '-c:v', 'libx264',
                 '-preset', self.preset,
                 '-tune', self.tune,
-                '-g', self.gop_size,  # Set keyframe interval
+                '-g', self.gop_size,
                 '-fflags', self.fflags,
                 '-flags', self.flags,
                 '-probesize', self.probesize,
-                '-muxdelay', '0',
-                '-muxpreload', '0',
                 '-f', 'flv',
-                self.rtmp_url
+                'rtmp://localhost/live/stream'  # Local RTMP server
             ]
 
             logger.info(f"Starting FFmpeg with command: {' '.join(stream_command)}")
@@ -636,8 +735,12 @@ class StreamLiterApp(QWidget):
 
             if self.local_rtmp_status_label.text() != "Local RTMP Server: Running":
                 logger.info("RTMP server not running. Attempting to start it...")
+
+                # Stop and restart the RTMP server with a delay
+                self.stop_local_rtmp_server()
+                time.sleep(2)  # Wait for 2 seconds
                 self.start_local_rtmp_server()
-                time.sleep(3)  # Give the server time to start
+                time.sleep(2)  # Wait for another 2 seconds to ensure server is ready
 
                 # Re-check the status
                 self.check_rtmp_server_status()
@@ -649,7 +752,7 @@ class StreamLiterApp(QWidget):
 
             # If RTMP server is running, start streaming
             logger.info("Starting test stream...")
-            rtmp_url = f"rtmp://127.0.0.1:1935/live/test"
+            rtmp_url = f"rtmp://127.0.0.1:1936/live/stream"
             self.rtmp_url_input.setText(rtmp_url)
             self.start_streaming_thread()
 
