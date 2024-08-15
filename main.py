@@ -141,7 +141,7 @@ class StreamLiterApp(QWidget):
 
     def initialize_vlc(self):
         try:
-            self.vlc_instance = vlc.Instance()
+            self.vlc_instance = vlc.Instance("--network-caching=50")
             self.vlc_player = self.vlc_instance.media_player_new()
             logger.info("VLC initialized successfully.")
         except Exception as e:
@@ -165,22 +165,30 @@ class StreamLiterApp(QWidget):
             if self.vlc_player.play() == -1:
                 raise Exception("VLC failed to play the stream")
 
-            # Delay status check to give VLC time to start playback
-            QTimer.singleShot(2000, self.check_vlc_status)
+            # Use a loop to check VLC status for a more robust status update
+            self.poll_vlc_status()
+
         except Exception as e:
             self.connection_status_label.setText("Connection Status: Failed to Load Stream")
             self.connection_status_label.setStyleSheet("font: 16px; color: red;")
             logger.error(f"Failed to load preview: {e}")
 
     def check_vlc_status(self):
-        if self.vlc_player.is_playing():
-            logger.info("Media player started successfully.")
-            self.connection_status_label.setText("Connection Status: Connected")
-            self.connection_status_label.setStyleSheet("font: 16px; color: green;")
-        else:
-            logger.warning("Media player failed to start.")
-            self.connection_status_label.setText("Connection Status: Failed to Start")
-            self.connection_status_label.setStyleSheet("font: 16px; color: red;")
+        max_attempts = 10
+        attempts = 0
+
+        while attempts < max_attempts:
+            time.sleep(0.5)  # Wait for half a second before each check
+            if self.vlc_player.is_playing():
+                logger.info("Media player started successfully.")
+                self.connection_status_label.setText("Connection Status: Connected")
+                self.connection_status_label.setStyleSheet("font: 16px; color: green;")
+                return
+            attempts += 1
+
+        logger.warning("Media player failed to start.")
+        self.connection_status_label.setText("Connection Status: Failed to Start")
+        self.connection_status_label.setStyleSheet("font: 16px; color: red;")
 
     def get_audio_devices(self):
         # Using a PowerShell script to get audio devices
@@ -296,14 +304,19 @@ class StreamLiterApp(QWidget):
 
         capture_command = [
             'C:\\ProgrammingProjects\\StreamLiter\\ffmpeg\\bin\\ffmpeg.exe',
-            '-video_size', '1920x1080',
-            '-framerate', '30',
+            '-video_size', self.video_res,
+            '-framerate', '20',
             '-f', 'gdigrab',
             '-i', 'desktop',
             '-pix_fmt', 'yuv420p',
             '-c:v', 'libx264',
-            '-b:v', '1000k',
-            '-g', '30',
+            '-preset', 'ultrafast',  # Fastest encoding
+            '-tune', 'zerolatency',  # Tuning for low latency
+            '-g', '15',  # Smaller GOP for quicker keyframes
+            '-fflags', 'nobuffer',
+            '-flags', 'low_delay',
+            '-probesize', '32',
+            '-analyzeduration', '0',
             '-f', 'flv',
             f'rtmp://{self.local_rtmp_server}:{self.local_rtmp_port}/live/stream'
         ]
